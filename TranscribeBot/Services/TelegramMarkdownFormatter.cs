@@ -14,6 +14,7 @@ internal static partial class TelegramMarkdownFormatter
 {
     private static readonly MarkdownPipeline Pipeline = new MarkdownPipelineBuilder()
         .UseEmphasisExtras(EmphasisExtraOptions.Strikethrough | EmphasisExtraOptions.Inserted)
+        .UseSoftlineBreakAsHardlineBreak()
         .Build();
 
     public static TelegramFormattedText Render(string text)
@@ -225,7 +226,7 @@ internal static partial class TelegramMarkdownFormatter
                     RenderTextWithEntity(code.Content, MessageEntityType.Code);
                     break;
                 case LineBreakInline lineBreak:
-                    AppendText(lineBreak.IsHard ? "\n" : " ");
+                    AppendText("\n");
                     break;
                 case EmphasisInline emphasis:
                     RenderEmphasisInline(emphasis);
