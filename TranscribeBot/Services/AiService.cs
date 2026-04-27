@@ -36,6 +36,16 @@ public class AiService : IAiService
         }
         """;
 
+    private const string ContextSummaryResponseSchema = """
+        {
+          "type": "object",
+          "properties": {
+            "summary": { "type": ["string", "null"] }
+          },
+          "additionalProperties": false
+        }
+        """;
+
     private readonly OpenAIClient _openAiClient;
     private readonly OpenRouterOptions _openRouterOptions;
     private readonly ILogger<AiService> _logger;
@@ -62,7 +72,9 @@ public class AiService : IAiService
         var chatClient = _openAiClient.GetChatClient(_openRouterOptions.ProcessingModel);
         var messages = new List<ChatMessage>
         {
-            new SystemChatMessage(BuildAudioSystemPrompt(request.ChatMode, request.ResponseLanguage))
+            new SystemChatMessage(BuildAudioSystemPrompt(
+                request.ChatMode,
+                request.ResponseLanguage))
         };
 
         var contextBlock = BuildContextBlock(request.ContextMessages);
@@ -122,6 +134,32 @@ public class AiService : IAiService
         return ParseCompressionCompletion(completionResult.Value);
     }
 
+    public async Task<ContextSummaryAiResult> SummarizeContextAsync(
+        ContextSummaryAiRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var chatClient = _openAiClient.GetChatClient(_openRouterOptions.CompressionModel);
+        var messages = new List<ChatMessage>
+        {
+            new SystemChatMessage(BuildContextSummarySystemPrompt(request.ResponseLanguage)),
+            new UserChatMessage(BuildContextSummaryBlock(request.Messages))
+        };
+
+        var options = new ChatCompletionOptions
+        {
+            ResponseFormat = ChatResponseFormat.CreateJsonSchemaFormat(
+                jsonSchemaFormatName: "context_summary",
+                jsonSchema: BinaryData.FromBytes(Encoding.UTF8.GetBytes(ContextSummaryResponseSchema)),
+                jsonSchemaIsStrict: true),
+            ReasoningEffortLevel = ResolveReasoningEffortLevel(_openRouterOptions.ReasoningEffort)
+        };
+
+        var completionResult = await chatClient.CompleteChatAsync(messages, options, cancellationToken);
+        return ParseContextSummaryCompletion(completionResult.Value);
+    }
+
     private AudioProcessingResult ParseAudioCompletion(ChatCompletion completion)
     {
         var root = ParseResponseRoot(completion);
@@ -156,6 +194,25 @@ public class AiService : IAiService
 
         _logger.LogInformation(
             "AI context compression completed. InputTokens={InputTokens}, OutputTokens={OutputTokens}",
+            result.InputTokens,
+            result.OutputTokens);
+
+        return result;
+    }
+
+    private ContextSummaryAiResult ParseContextSummaryCompletion(ChatCompletion completion)
+    {
+        var root = ParseResponseRoot(completion);
+        var usage = completion.Usage;
+        var result = new ContextSummaryAiResult
+        {
+            Summary = TryGetOptionalString(root, "summary"),
+            InputTokens = usage?.InputTokenCount ?? 0,
+            OutputTokens = usage?.OutputTokenCount ?? 0
+        };
+
+        _logger.LogInformation(
+            "AI context summary completed. InputTokens={InputTokens}, OutputTokens={OutputTokens}",
             result.InputTokens,
             result.OutputTokens);
 
@@ -208,7 +265,9 @@ public class AiService : IAiService
         };
     }
 
-    private static string BuildAudioSystemPrompt(ChatMode chatMode, string responseLanguage)
+    private static string BuildAudioSystemPrompt(
+        ChatMode chatMode,
+        string responseLanguage)
     {
         var actions = new List<string>();
 
@@ -236,8 +295,12 @@ public class AiService : IAiService
             "You process user voice messages. " +
             $"Your task is to {string.Join("; ", actions)}. " +
             $"Write the content of returned fields in '{responseLanguage}'. " +
+            "Markdown formatting is allowed in returned text. Use standard Markdown for simple formatting. " +
+            "Use '**bold**', '*italic*', '`code`', fenced code blocks, '[text](url)', '# headings', and flat lists with '-' or '1.'. " +
+            "Do not use tables or nested lists. " +
             "Fill only the fields that correspond to the selected modes. " +
-            "Return null for fields that were not requested. " +
+            "Fill normalized and summarized only when their corresponding modes are selected. " +
+            "Return null for optional fields that were not requested. " +
             "For transcription, if the audio clearly contains multiple different speakers, separate their utterances with labels such as 'Speaker 1', 'Speaker 2', and so on. " +
             "Use a real person's name only if the speaker identity is explicitly clear from the audio or context. " +
             "Do not guess or assign names just because a name was mentioned in the conversation. " +
@@ -256,9 +319,30 @@ public class AiService : IAiService
         return
             "You compress a user's message history to reduce token usage. " +
             $"Return the result in '{responseLanguage}'. " +
+            "Markdown formatting is allowed in returned text. Use standard Markdown for simple formatting. " +
+            "Use '**bold**', '*italic*', '`code`', fenced code blocks, '[text](url)', '# headings', and flat lists with '-' or '1.'. " +
+            "Do not use tables or nested lists. " +
             "Preserve facts, agreements, entities, names, numbers, deadlines, and important context. " +
             "Remove repetition and secondary details. " +
             "Return only JSON with the compressedText field.";
+    }
+
+    private static string BuildContextSummarySystemPrompt(string responseLanguage)
+    {
+        return
+            "You create a detailed summary of the user's saved message context. " +
+            $"Return the result in '{responseLanguage}'. " +
+            "Markdown formatting is allowed in returned text. Use standard Markdown for simple formatting. " +
+            "Use '**bold**', '*italic*', '`code`', fenced code blocks, '[text](url)', '# headings', and flat lists with '-' or '1.'. " +
+            "Do not use tables or nested lists. " +
+            "You will receive full transcriptions for context messages and, for some entries, an additional compressed context snapshot. " +
+            "Use the full transcriptions as the primary source of truth. " +
+            "Use compressed context only as supporting memory and to preserve older facts if they are consistent with the transcriptions. " +
+            "Produce a detailed summary with clear topic sections. " +
+            "If the messages contain unrelated discussions, separate them into distinct topics. " +
+            "For each topic, preserve participants, decisions, facts, dates, numbers, reasons, dependencies, open questions, and action items when present. " +
+            "Do not invent information and do not merge unrelated topics. " +
+            "Return only JSON with the summary field.";
     }
 
     private static string BuildContextBlock(IReadOnlyCollection<AiRequestContextMessage> contextMessages)
@@ -279,6 +363,43 @@ public class AiService : IAiService
                 .AppendLine("]")
                 .AppendLine(message.Content)
                 .AppendLine();
+        }
+
+        return builder.ToString().TrimEnd();
+    }
+
+    private static string BuildContextSummaryBlock(IReadOnlyCollection<ContextSummarySourceMessage> messages)
+    {
+        if (messages.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder();
+        builder.AppendLine("Saved context messages:");
+
+        foreach (var message in messages.OrderBy(item => item.CreatedAt))
+        {
+            builder
+                .Append('[')
+                .Append(message.CreatedAt.ToString("u"))
+                .AppendLine("]");
+
+            if (!string.IsNullOrWhiteSpace(message.Transcription))
+            {
+                builder
+                    .AppendLine("Full transcription:")
+                    .AppendLine(message.Transcription);
+            }
+
+            if (!string.IsNullOrWhiteSpace(message.CompressedText))
+            {
+                builder
+                    .AppendLine("Compressed context snapshot:")
+                    .AppendLine(message.CompressedText);
+            }
+
+            builder.AppendLine();
         }
 
         return builder.ToString().TrimEnd();

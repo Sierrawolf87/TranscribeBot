@@ -124,10 +124,13 @@ public class TranscribeService(
             throw new InvalidOperationException("AI service returned an empty compressed context.");
         }
 
+        var mergedTranscription = BuildMergedTranscription(messages);
+
         dbContext.Messages.RemoveRange(messages);
         dbContext.Messages.Add(new Messages
         {
             UserId = user.Id,
+            Transcription = mergedTranscription,
             CompressedText = aiResult.CompressedText,
             InputTokens = aiResult.InputTokens,
             OutputTokens = aiResult.OutputTokens
@@ -145,6 +148,48 @@ public class TranscribeService(
             OutputTokens = aiResult.OutputTokens,
             Message = $"Контекст сжат. Сообщений объединено: {messages.Count}."
         };
+    }
+
+    public async Task<IReadOnlyCollection<string>> GetContextSummaryAsync(
+        long telegramUserId,
+        string? username,
+        CancellationToken cancellationToken = default)
+    {
+        var user = await GetOrCreateTrackedUserAsync(telegramUserId, username, cancellationToken);
+        var messages = await dbContext.Messages
+            .Where(message => message.UserId == user.Id)
+            .OrderBy(message => message.CreatedAt)
+            .ToListAsync(cancellationToken);
+
+        if (messages.Count == 0)
+        {
+            return ["Контекст пуст. Саммари строить не из чего."];
+        }
+
+        var aiResult = await aiService.SummarizeContextAsync(
+            new ContextSummaryAiRequest
+            {
+                ResponseLanguage = user.Settings.Language ?? "ru",
+                Messages = messages
+                    .Select(message => new ContextSummarySourceMessage
+                    {
+                        CreatedAt = message.CreatedAt,
+                        Transcription = message.Transcription,
+                        CompressedText = message.CompressedText
+                    })
+                    .ToList()
+            },
+            cancellationToken);
+
+        if (string.IsNullOrWhiteSpace(aiResult.Summary))
+        {
+            throw new InvalidOperationException("AI service returned an empty context summary.");
+        }
+
+        user.TotalTokenUsage += aiResult.InputTokens + aiResult.OutputTokens;
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        return SplitForTelegram([$"Саммари по всему контексту\n{aiResult.Summary}"]);
     }
 
     public async Task<IReadOnlyCollection<string>> ProcessAudioAsync(
@@ -187,12 +232,16 @@ public class TranscribeService(
                 ? await LoadContextMessagesAsync(user.Id, cancellationToken)
                 : [];
 
+            var aiChatMode = user.Settings.UseContext
+                ? user.Settings.ChatMode | ChatMode.Transcribe
+                : user.Settings.ChatMode;
+
             var aiRequest = new TranscriptionAiRequest
             {
                 AudioStream = preparedAudioStream,
                 FileName = Path.GetFileName(preparedAudioPath),
                 ResponseLanguage = user.Settings.Language ?? "ru",
-                ChatMode = user.Settings.ChatMode,
+                ChatMode = aiChatMode,
                 ContextMessages = contextMessages
             };
 
@@ -362,6 +411,16 @@ public class TranscribeService(
                ?? message.Normalized
                ?? message.Transcription
                ?? string.Empty;
+    }
+
+    private static string? BuildMergedTranscription(IEnumerable<Messages> messages)
+    {
+        var parts = messages
+            .Where(message => !string.IsNullOrWhiteSpace(message.Transcription))
+            .Select(message => $"[{message.CreatedAt:u}]\n{message.Transcription!.Trim()}")
+            .ToList();
+
+        return parts.Count == 0 ? null : string.Join("\n\n", parts);
     }
 
     private static async Task SaveToFileAsync(Stream source, string path, CancellationToken cancellationToken)

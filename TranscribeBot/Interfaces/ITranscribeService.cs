@@ -11,6 +11,7 @@ public interface ITranscribeService
     Task<UserSettings> SetLanguageAsync(long telegramUserId, string? username, string language, CancellationToken cancellationToken = default);
     Task<int> ResetContextAsync(long telegramUserId, string? username, CancellationToken cancellationToken = default);
     Task<CompressionResult> CompressContextAsync(long telegramUserId, string? username, CancellationToken cancellationToken = default);
+    Task<IReadOnlyCollection<string>> GetContextSummaryAsync(long telegramUserId, string? username, CancellationToken cancellationToken = default);
     Task<IReadOnlyCollection<string>> ProcessAudioAsync(AudioTranscriptionRequest request, CancellationToken cancellationToken = default);
     Task<bool> IsUserAllowedAsync(long telegramUserId, CancellationToken cancellationToken = default);
     Task<bool> AddAllowedUserAsync(long telegramUserId, long addedByTelegramUserId, CancellationToken cancellationToken = default);

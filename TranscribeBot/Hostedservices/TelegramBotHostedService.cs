@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Telegram.Bot;
+using Telegram.Bot.Exceptions;
 using Telegram.Bot.Polling;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
@@ -9,6 +10,7 @@ using TranscribeBot.Interfaces;
 using TranscribeBot.Models;
 using TranscribeBot.Models.Enums;
 using TranscribeBot.Options;
+using TranscribeBot.Services;
 
 namespace TranscribeBot.Hostedservices;
 
@@ -22,6 +24,8 @@ public class TelegramBotHostedService(
     private const string SettingsCommand = "/settings";
     private const string ResetContextCommand = "/reset_context";
     private const string CompressCommand = "/compress";
+    private const string ContextSummaryCommand = "/context_summary";
+    private const string ContextSummaryTextCommand = "Получить саммари по всем сообщениям в контексте";
     private const string AllowUserCommand = "/allow_user";
     private const string DenyUserCommand = "/deny_user";
     private const string AllowedUsersCommand = "/allowed_users";
@@ -137,6 +141,12 @@ public class TelegramBotHostedService(
             return;
         }
 
+        if (string.Equals(message.Text?.Trim(), ContextSummaryTextCommand, StringComparison.OrdinalIgnoreCase))
+        {
+            await HandleContextSummaryCommandAsync(botClient, message, transcribeService, cancellationToken);
+            return;
+        }
+
         if (message.Voice is null && message.VideoNote is null && message.Video is null)
         {
             await botClient.SendMessage(
@@ -168,7 +178,8 @@ public class TelegramBotHostedService(
 
         foreach (var responseMessage in responseMessages)
         {
-            await botClient.SendMessage(
+            await SendTextMessageAsync(
+                botClient,
                 chatId: message.Chat.Id,
                 text: responseMessage,
                 replyParameters: new ReplyParameters
@@ -197,7 +208,8 @@ public class TelegramBotHostedService(
                     token => transcribeService.GetOrCreateUserAsync(telegramUserId, message.From?.Username, token),
                     cancellationToken);
 
-                await botClient.SendMessage(
+                await SendTextMessageAsync(
+                    botClient,
                     chatId: message.Chat.Id,
                     text: BuildStartMessage(),
                     replyMarkup: await BuildSettingsMarkupAsync(transcribeService, telegramUserId, message.From?.Username, cancellationToken),
@@ -210,7 +222,8 @@ public class TelegramBotHostedService(
                     token => transcribeService.GetOrCreateUserAsync(telegramUserId, message.From?.Username, token),
                     cancellationToken);
 
-                await botClient.SendMessage(
+                await SendTextMessageAsync(
+                    botClient,
                     chatId: message.Chat.Id,
                     text: await BuildSettingsTextAsync(transcribeService, telegramUserId, message.From?.Username, cancellationToken),
                     replyMarkup: await BuildSettingsMarkupAsync(transcribeService, telegramUserId, message.From?.Username, cancellationToken),
@@ -246,6 +259,10 @@ public class TelegramBotHostedService(
                     cancellationToken: cancellationToken);
                 break;
             }
+
+            case ContextSummaryCommand:
+                await HandleContextSummaryCommandAsync(botClient, message, transcribeService, cancellationToken);
+                break;
 
             case AllowUserCommand:
             {
@@ -321,7 +338,7 @@ public class TelegramBotHostedService(
             default:
                 await botClient.SendMessage(
                     chatId: message.Chat.Id,
-                    text: "Доступные команды: /start, /settings, /reset_context, /compress, /allow_user, /deny_user, /allowed_users.",
+                    text: "Доступные команды: /start, /settings, /reset_context, /compress, /context_summary, /allow_user, /deny_user, /allowed_users.",
                     cancellationToken: cancellationToken);
                 break;
         }
@@ -419,7 +436,8 @@ public class TelegramBotHostedService(
                 return;
         }
 
-        await botClient.EditMessageText(
+        await EditTextMessageAsync(
+            botClient,
             chatId: callbackQuery.Message.Chat.Id,
             messageId: callbackQuery.Message.Id,
             text: await BuildSettingsTextAsync(transcribeService, telegramUserId, username, cancellationToken),
@@ -429,6 +447,33 @@ public class TelegramBotHostedService(
         await botClient.AnswerCallbackQuery(
             callbackQueryId: callbackQuery.Id,
             cancellationToken: cancellationToken);
+    }
+
+    private async Task HandleContextSummaryCommandAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        ITranscribeService transcribeService,
+        CancellationToken cancellationToken)
+    {
+        var telegramUserId = GetTelegramUserId(message);
+        var responseMessages = await userProcessingQueue.ExecuteAsync(
+            telegramUserId,
+            token => transcribeService.GetContextSummaryAsync(telegramUserId, message.From?.Username, token),
+            cancellationToken);
+
+        foreach (var responseMessage in responseMessages)
+        {
+            await SendTextMessageAsync(
+                botClient,
+                chatId: message.Chat.Id,
+                text: responseMessage,
+                replyParameters: new ReplyParameters
+                {
+                    MessageId = message.Id,
+                    AllowSendingWithoutReply = true
+                },
+                cancellationToken: cancellationToken);
+        }
     }
 
     private async Task<TelegramAudioFile> DownloadTelegramAudioAsync(
@@ -486,6 +531,7 @@ public class TelegramBotHostedService(
             "/settings - настройки режимов, контекста и языка\n" +
             "/reset_context - очистить историю\n" +
             "/compress - принудительно сжать историю\n" +
+            "/context_summary - получить подробное саммари всего контекста\n" +
             "/allow_user <id> - дать доступ пользователю\n" +
             "/deny_user <id> - забрать доступ у пользователя\n" +
             "/allowed_users - показать список пользователей с доступом";
@@ -625,6 +671,7 @@ public class TelegramBotHostedService(
                 new BotCommand { Command = "settings", Description = "Настроить режимы, контекст и язык" },
                 new BotCommand { Command = "reset_context", Description = "Очистить историю контекста" },
                 new BotCommand { Command = "compress", Description = "Принудительно сжать историю" },
+                new BotCommand { Command = "context_summary", Description = "Получить подробное саммари контекста" },
                 new BotCommand { Command = "allow_user", Description = "Дать доступ пользователю" },
                 new BotCommand { Command = "deny_user", Description = "Забрать доступ у пользователя" },
                 new BotCommand { Command = "allowed_users", Description = "Показать список пользователей с доступом" }
@@ -676,4 +723,78 @@ public class TelegramBotHostedService(
             .Distinct()
             .ToList();
     }
+
+    private async Task SendTextMessageAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        string text,
+        CancellationToken cancellationToken,
+        ReplyParameters? replyParameters = null,
+        ReplyMarkup? replyMarkup = null)
+    {
+        var formattedText = TelegramMarkdownFormatter.Render(text);
+
+        try
+        {
+            await botClient.SendMessage(
+                chatId: chatId,
+                text: formattedText.Text,
+                entities: formattedText.Entities,
+                replyParameters: replyParameters,
+                replyMarkup: replyMarkup,
+                cancellationToken: cancellationToken);
+        }
+        catch (ApiRequestException exception) when (IsFormattingParsingError(exception))
+        {
+            logger.LogWarning(exception, "Telegram rejected formatted message. Falling back to plain text.");
+
+            await botClient.SendMessage(
+                chatId: chatId,
+                text: formattedText.Text,
+                replyParameters: replyParameters,
+                replyMarkup: replyMarkup,
+                cancellationToken: cancellationToken);
+        }
+    }
+
+    private async Task EditTextMessageAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        int messageId,
+        string text,
+        CancellationToken cancellationToken,
+        InlineKeyboardMarkup? replyMarkup = null)
+    {
+        var formattedText = TelegramMarkdownFormatter.Render(text);
+
+        try
+        {
+            await botClient.EditMessageText(
+                chatId: chatId,
+                messageId: messageId,
+                text: formattedText.Text,
+                entities: formattedText.Entities,
+                replyMarkup: replyMarkup,
+                cancellationToken: cancellationToken);
+        }
+        catch (ApiRequestException exception) when (IsFormattingParsingError(exception))
+        {
+            logger.LogWarning(exception, "Telegram rejected formatted edit. Falling back to plain text.");
+
+            await botClient.EditMessageText(
+                chatId: chatId,
+                messageId: messageId,
+                text: formattedText.Text,
+                replyMarkup: replyMarkup,
+                cancellationToken: cancellationToken);
+        }
+    }
+
+    private static bool IsFormattingParsingError(ApiRequestException exception)
+    {
+        return exception.Message.Contains("parse entities", StringComparison.OrdinalIgnoreCase)
+               || exception.Message.Contains("can't parse entities", StringComparison.OrdinalIgnoreCase);
+    }
 }
+
+
