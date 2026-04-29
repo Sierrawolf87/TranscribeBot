@@ -203,9 +203,10 @@ public class TranscribeService(
             throw new InvalidOperationException("Файл длиннее 20 минут. Такой файл не обрабатывается.");
         }
 
+        var settings = request.Settings;
         var user = await GetOrCreateTrackedUserAsync(request.TelegramUserId, request.Username, cancellationToken);
 
-        if (user.Settings.UseContext)
+        if (settings.UseContext)
         {
             var outputTokens = await dbContext.Messages
                 .Where(message => message.UserId == user.Id)
@@ -224,27 +225,29 @@ public class TranscribeService(
         try
         {
             await SaveToFileAsync(request.AudioStream, inputPath, cancellationToken);
+            await ReportProgressAsync(request, "🎛️ Подготовка аудио...", cancellationToken);
             await EnsureAudioPreparationAsync(inputPath, preparedAudioPath, cancellationToken);
 
             await using var preparedAudioStream = File.OpenRead(preparedAudioPath);
 
-            var contextMessages = user.Settings.UseContext
+            var contextMessages = settings.UseContext
                 ? await LoadContextMessagesAsync(user.Id, cancellationToken)
                 : [];
 
-            var aiChatMode = user.Settings.UseContext
-                ? user.Settings.ChatMode | ChatMode.Transcribe
-                : user.Settings.ChatMode;
+            var aiChatMode = settings.UseContext
+                ? settings.ChatMode | ChatMode.Transcribe
+                : settings.ChatMode;
 
             var aiRequest = new TranscriptionAiRequest
             {
                 AudioStream = preparedAudioStream,
                 FileName = Path.GetFileName(preparedAudioPath),
-                ResponseLanguage = user.Settings.Language ?? "ru",
+                ResponseLanguage = settings.Language,
                 ChatMode = aiChatMode,
                 ContextMessages = contextMessages
             };
 
+            await ReportProgressAsync(request, "📝 Транскрипция...", cancellationToken);
             var aiResult = await aiService.ProcessAudioAsync(aiRequest, cancellationToken);
             var totalInputTokens = aiResult.InputTokens;
             var totalOutputTokens = aiResult.OutputTokens;
@@ -270,7 +273,7 @@ public class TranscribeService(
 
             user.TotalTokenUsage += totalInputTokens + totalOutputTokens;
 
-            if (user.Settings.UseContext)
+            if (settings.UseContext)
             {
                 dbContext.Messages.Add(new Messages
                 {
@@ -285,7 +288,8 @@ public class TranscribeService(
 
             await dbContext.SaveChangesAsync(cancellationToken);
 
-            return BuildTelegramMessages(aiResult, user.Settings.ChatMode);
+            await ReportProgressAsync(request, "📨 Подготовка ответа...", cancellationToken);
+            return BuildTelegramMessages(aiResult, settings.ChatMode);
         }
         finally
         {
@@ -428,6 +432,14 @@ public class TranscribeService(
         source.Position = 0;
         await using var target = File.Create(path);
         await source.CopyToAsync(target, cancellationToken);
+    }
+
+    private static Task ReportProgressAsync(
+        AudioTranscriptionRequest request,
+        string status,
+        CancellationToken cancellationToken)
+    {
+        return request.ReportProgressAsync?.Invoke(status, cancellationToken) ?? Task.CompletedTask;
     }
 
     private async Task EnsureAudioPreparationAsync(string inputPath, string outputPath, CancellationToken cancellationToken)

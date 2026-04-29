@@ -4,6 +4,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Options;
 using OpenAI;
 using OpenAI.Chat;
+using Polly;
 using TranscribeBot.Interfaces;
 using TranscribeBot.Models;
 using TranscribeBot.Models.Ai;
@@ -14,6 +15,12 @@ namespace TranscribeBot.Services;
 
 public class AiService : IAiService
 {
+    private static readonly AsyncPolicy AiRetryPolicy = Policy
+        .Handle<ClientResultException>(IsTransientAiException)
+        .Or<HttpRequestException>()
+        .Or<TimeoutException>()
+        .WaitAndRetryAsync(3, GetAiRetryDelay);
+
     private const string AudioResponseSchema = """
         {
           "type": "object",
@@ -103,7 +110,9 @@ public class AiService : IAiService
             ReasoningEffortLevel = ResolveReasoningEffortLevel(_openRouterOptions.ReasoningEffort)
         };
 
-        var completionResult = await chatClient.CompleteChatAsync(messages, options, cancellationToken);
+        var completionResult = await AiRetryPolicy.ExecuteAsync(
+            token => chatClient.CompleteChatAsync(messages, options, token),
+            cancellationToken);
         return ParseAudioCompletion(completionResult.Value);
     }
 
@@ -130,7 +139,9 @@ public class AiService : IAiService
             ReasoningEffortLevel = ResolveReasoningEffortLevel(_openRouterOptions.ReasoningEffort)
         };
 
-        var completionResult = await chatClient.CompleteChatAsync(messages, options, cancellationToken);
+        var completionResult = await AiRetryPolicy.ExecuteAsync(
+            token => chatClient.CompleteChatAsync(messages, options, token),
+            cancellationToken);
         return ParseCompressionCompletion(completionResult.Value);
     }
 
@@ -156,7 +167,9 @@ public class AiService : IAiService
             ReasoningEffortLevel = ResolveReasoningEffortLevel(_openRouterOptions.ReasoningEffort)
         };
 
-        var completionResult = await chatClient.CompleteChatAsync(messages, options, cancellationToken);
+        var completionResult = await AiRetryPolicy.ExecuteAsync(
+            token => chatClient.CompleteChatAsync(messages, options, token),
+            cancellationToken);
         return ParseContextSummaryCompletion(completionResult.Value);
     }
 
@@ -263,6 +276,18 @@ public class AiService : IAiService
             _ => throw new InvalidOperationException(
                 $"Unsupported OpenRouter reasoning effort '{reasoningEffort}'. Supported values: none, minimal, low, medium, high.")
         };
+    }
+
+    private static bool IsTransientAiException(ClientResultException exception)
+    {
+        return exception.Status is 408 or 429 or 500 or 502 or 503 or 504;
+    }
+
+    private static TimeSpan GetAiRetryDelay(int retryAttempt)
+    {
+        var delaySeconds = Math.Min(10, Math.Pow(2, retryAttempt - 1));
+        var jitterMilliseconds = Random.Shared.Next(100, 700);
+        return TimeSpan.FromSeconds(delaySeconds) + TimeSpan.FromMilliseconds(jitterMilliseconds);
     }
 
     private static string BuildAudioSystemPrompt(

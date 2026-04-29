@@ -1,5 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
+using Polly;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Polling;
@@ -29,6 +30,12 @@ public class TelegramBotHostedService(
     private const string AllowUserCommand = "/allow_user";
     private const string DenyUserCommand = "/deny_user";
     private const string AllowedUsersCommand = "/allowed_users";
+
+    private static readonly AsyncPolicy TelegramRetryPolicy = Policy
+        .Handle<ApiRequestException>(IsTransientTelegramException)
+        .Or<HttpRequestException>()
+        .Or<TimeoutException>()
+        .WaitAndRetryAsync(3, GetTelegramRetryDelay);
 
     private readonly TelegramOptions _telegramOptions = telegramOptions.Value;
     private TelegramBotClient? _botClient;
@@ -143,7 +150,7 @@ public class TelegramBotHostedService(
 
         if (string.Equals(message.Text?.Trim(), ContextSummaryTextCommand, StringComparison.OrdinalIgnoreCase))
         {
-            await HandleContextSummaryCommandAsync(botClient, message, transcribeService, cancellationToken);
+            await HandleContextSummaryCommandAsync(botClient, message, cancellationToken);
             return;
         }
 
@@ -156,38 +163,99 @@ public class TelegramBotHostedService(
             return;
         }
 
-        var responseMessages = await userProcessingQueue.ExecuteAsync(
-            telegramUserId,
-            async processingCancellationToken =>
+        var user = await transcribeService.GetOrCreateUserAsync(telegramUserId, message.From?.Username, cancellationToken);
+        var settingsSnapshot = AudioProcessingSettingsSnapshot.From(user.Settings);
+        var statusMessage = await SendTextMessageAsync(
+            botClient,
+            chatId: message.Chat.Id,
+            text: "⏳ В очереди",
+            replyParameters: new ReplyParameters
             {
-                await transcribeService.GetOrCreateUserAsync(telegramUserId, message.From?.Username, processingCancellationToken);
-
-                using var audioFile = await DownloadTelegramAudioAsync(botClient, message, processingCancellationToken);
-                return await transcribeService.ProcessAudioAsync(
-                    new AudioTranscriptionRequest
-                    {
-                        TelegramUserId = telegramUserId,
-                        Username = message.From?.Username,
-                        AudioStream = audioFile.Content,
-                        FileName = audioFile.FileName,
-                        DurationSeconds = audioFile.DurationSeconds
-                    },
-                    processingCancellationToken);
+                MessageId = message.Id,
+                AllowSendingWithoutReply = true
             },
-            cancellationToken);
+            cancellationToken: cancellationToken);
 
-        foreach (var responseMessage in responseMessages)
+        await userProcessingQueue.EnqueueAsync(
+            telegramUserId,
+            token => ProcessAudioMessageAsync(botClient, message, settingsSnapshot, statusMessage.Id, token),
+            requiresGlobalSlot: true,
+            preserveUserOrder: settingsSnapshot.UseContext,
+            cancellationToken);
+    }
+
+    private async Task ProcessAudioMessageAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        AudioProcessingSettingsSnapshot settingsSnapshot,
+        int statusMessageId,
+        CancellationToken cancellationToken)
+    {
+        var telegramUserId = GetTelegramUserId(message);
+
+        try
         {
-            await SendTextMessageAsync(
+            await EditTextMessageAsync(
                 botClient,
                 chatId: message.Chat.Id,
-                text: responseMessage,
-                replyParameters: new ReplyParameters
-                {
-                    MessageId = message.Id,
-                    AllowSendingWithoutReply = true
-                },
+                messageId: statusMessageId,
+                text: "🎧 Извлечение аудио...",
                 cancellationToken: cancellationToken);
+
+            await using var scope = serviceScopeFactory.CreateAsyncScope();
+            var transcribeService = scope.ServiceProvider.GetRequiredService<ITranscribeService>();
+            using var audioFile = await DownloadTelegramAudioAsync(botClient, message, cancellationToken);
+
+            var responseMessages = await transcribeService.ProcessAudioAsync(
+                new AudioTranscriptionRequest
+                {
+                    TelegramUserId = telegramUserId,
+                    Username = message.From?.Username,
+                    AudioStream = audioFile.Content,
+                    FileName = audioFile.FileName,
+                    DurationSeconds = audioFile.DurationSeconds,
+                    Settings = settingsSnapshot,
+                    ReportProgressAsync = (status, token) => EditTextMessageAsync(
+                        botClient,
+                        chatId: message.Chat.Id,
+                        messageId: statusMessageId,
+                        text: status,
+                        cancellationToken: token)
+                },
+                cancellationToken);
+
+            foreach (var responseMessage in responseMessages)
+            {
+                await SendTextMessageAsync(
+                    botClient,
+                    chatId: message.Chat.Id,
+                    text: responseMessage,
+                    replyParameters: new ReplyParameters
+                    {
+                        MessageId = message.Id,
+                        AllowSendingWithoutReply = true
+                    },
+                    cancellationToken: cancellationToken);
+            }
+
+            await DeleteMessageAsync(botClient, message.Chat.Id, statusMessageId, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            logger.LogInformation(
+                "Audio processing cancelled for TelegramUserId={TelegramUserId}, MessageId={MessageId}.",
+                telegramUserId,
+                message.Id);
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(
+                exception,
+                "Audio processing failed for TelegramUserId={TelegramUserId}, MessageId={MessageId}.",
+                telegramUserId,
+                message.Id);
+
+            await TryEditStatusErrorAsync(botClient, message.Chat.Id, statusMessageId, exception, CancellationToken.None);
         }
     }
 
@@ -203,10 +271,7 @@ public class TelegramBotHostedService(
         switch (command.ToLowerInvariant())
         {
             case "/start":
-                await userProcessingQueue.ExecuteAsync(
-                    telegramUserId,
-                    token => transcribeService.GetOrCreateUserAsync(telegramUserId, message.From?.Username, token),
-                    cancellationToken);
+                await transcribeService.GetOrCreateUserAsync(telegramUserId, message.From?.Username, cancellationToken);
 
                 await SendTextMessageAsync(
                     botClient,
@@ -217,10 +282,7 @@ public class TelegramBotHostedService(
                 break;
 
             case SettingsCommand:
-                await userProcessingQueue.ExecuteAsync(
-                    telegramUserId,
-                    token => transcribeService.GetOrCreateUserAsync(telegramUserId, message.From?.Username, token),
-                    cancellationToken);
+                await transcribeService.GetOrCreateUserAsync(telegramUserId, message.From?.Username, cancellationToken);
 
                 await SendTextMessageAsync(
                     botClient,
@@ -232,36 +294,41 @@ public class TelegramBotHostedService(
 
             case ResetContextCommand:
             {
-                var deleted = await userProcessingQueue.ExecuteAsync(
-                    telegramUserId,
-                    token => transcribeService.ResetContextAsync(telegramUserId, message.From?.Username, token),
+                await EnqueueContextCommandAsync(
+                    botClient,
+                    message,
+                    async (service, token) =>
+                    {
+                        var deletedCount = await service.ResetContextAsync(telegramUserId, message.From?.Username, token);
+                        return
+                        [
+                            deletedCount == 0
+                                ? "Контекст уже пуст."
+                                : $"Контекст очищен. Удалено сообщений: {deletedCount}."
+                        ];
+                    },
                     cancellationToken);
-
-                await botClient.SendMessage(
-                    chatId: message.Chat.Id,
-                    text: deleted == 0
-                        ? "Контекст уже пуст."
-                        : $"Контекст очищен. Удалено сообщений: {deleted}.",
-                    cancellationToken: cancellationToken);
                 break;
+
             }
 
             case CompressCommand:
             {
-                var result = await userProcessingQueue.ExecuteAsync(
-                    telegramUserId,
-                    token => transcribeService.CompressContextAsync(telegramUserId, message.From?.Username, token),
+                await EnqueueContextCommandAsync(
+                    botClient,
+                    message,
+                    async (service, token) =>
+                    {
+                        var compressionResult = await service.CompressContextAsync(telegramUserId, message.From?.Username, token);
+                        return [compressionResult.Message];
+                    },
                     cancellationToken);
-
-                await botClient.SendMessage(
-                    chatId: message.Chat.Id,
-                    text: result.Message,
-                    cancellationToken: cancellationToken);
                 break;
+
             }
 
             case ContextSummaryCommand:
-                await HandleContextSummaryCommandAsync(botClient, message, transcribeService, cancellationToken);
+                await HandleContextSummaryCommandAsync(botClient, message, cancellationToken);
                 break;
 
             case AllowUserCommand:
@@ -449,6 +516,85 @@ public class TelegramBotHostedService(
             cancellationToken: cancellationToken);
     }
 
+    private Task HandleContextSummaryCommandAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        CancellationToken cancellationToken)
+    {
+        return EnqueueContextCommandAsync(
+            botClient,
+            message,
+            (service, token) => service.GetContextSummaryAsync(GetTelegramUserId(message), message.From?.Username, token),
+            cancellationToken);
+    }
+
+    private async Task EnqueueContextCommandAsync(
+        ITelegramBotClient botClient,
+        Message message,
+        Func<ITranscribeService, CancellationToken, Task<IReadOnlyCollection<string>>> action,
+        CancellationToken cancellationToken)
+    {
+        var telegramUserId = GetTelegramUserId(message);
+        var statusMessage = await SendTextMessageAsync(
+            botClient,
+            chatId: message.Chat.Id,
+            text: "⏳ В очереди",
+            replyParameters: new ReplyParameters
+            {
+                MessageId = message.Id,
+                AllowSendingWithoutReply = true
+            },
+            cancellationToken: cancellationToken);
+
+        await userProcessingQueue.EnqueueAsync(
+            telegramUserId,
+            async token =>
+            {
+                try
+                {
+                    await EditTextMessageAsync(
+                        botClient,
+                        chatId: message.Chat.Id,
+                        messageId: statusMessage.Id,
+                        text: "⚙️ Обработка команды...",
+                        cancellationToken: token);
+
+                    await using var scope = serviceScopeFactory.CreateAsyncScope();
+                    var transcribeService = scope.ServiceProvider.GetRequiredService<ITranscribeService>();
+                    var responseMessages = await action(transcribeService, token);
+
+                    foreach (var responseMessage in responseMessages)
+                    {
+                        await SendTextMessageAsync(
+                            botClient,
+                            chatId: message.Chat.Id,
+                            text: responseMessage,
+                            replyParameters: new ReplyParameters
+                            {
+                                MessageId = message.Id,
+                                AllowSendingWithoutReply = true
+                            },
+                            cancellationToken: token);
+                    }
+
+                    await DeleteMessageAsync(botClient, message.Chat.Id, statusMessage.Id, token);
+                }
+                catch (Exception exception)
+                {
+                    logger.LogError(
+                        exception,
+                        "Queued context command failed for TelegramUserId={TelegramUserId}, MessageId={MessageId}.",
+                        telegramUserId,
+                        message.Id);
+
+                    await TryEditStatusErrorAsync(botClient, message.Chat.Id, statusMessage.Id, exception, CancellationToken.None);
+                }
+            },
+            requiresGlobalSlot: false,
+            preserveUserOrder: true,
+            cancellationToken);
+    }
+
     private async Task HandleContextSummaryCommandAsync(
         ITelegramBotClient botClient,
         Message message,
@@ -510,9 +656,13 @@ public class TelegramBotHostedService(
             throw new InvalidOperationException("Message does not contain supported media.");
         }
 
-        var tgFile = await botClient.GetFile(fileId, cancellationToken);
+        var tgFile = await TelegramRetryPolicy.ExecuteAsync(
+            token => botClient.GetFile(fileId, token),
+            cancellationToken);
         var memoryStream = new MemoryStream();
-        await botClient.DownloadFile(tgFile, memoryStream, cancellationToken);
+        await TelegramRetryPolicy.ExecuteAsync(
+            token => botClient.DownloadFile(tgFile, memoryStream, token),
+            cancellationToken);
         memoryStream.Position = 0;
 
         return new TelegramAudioFile
@@ -724,7 +874,7 @@ public class TelegramBotHostedService(
             .ToList();
     }
 
-    private async Task SendTextMessageAsync(
+    private async Task<Message> SendTextMessageAsync(
         ITelegramBotClient botClient,
         ChatId chatId,
         string text,
@@ -736,24 +886,28 @@ public class TelegramBotHostedService(
 
         try
         {
-            await botClient.SendMessage(
-                chatId: chatId,
-                text: formattedText.Text,
-                entities: formattedText.Entities,
-                replyParameters: replyParameters,
-                replyMarkup: replyMarkup,
-                cancellationToken: cancellationToken);
+            return await TelegramRetryPolicy.ExecuteAsync(
+                token => botClient.SendMessage(
+                    chatId: chatId,
+                    text: formattedText.Text,
+                    entities: formattedText.Entities,
+                    replyParameters: replyParameters,
+                    replyMarkup: replyMarkup,
+                    cancellationToken: token),
+                cancellationToken);
         }
         catch (ApiRequestException exception) when (IsFormattingParsingError(exception))
         {
             logger.LogWarning(exception, "Telegram rejected formatted message. Falling back to plain text.");
 
-            await botClient.SendMessage(
-                chatId: chatId,
-                text: formattedText.Text,
-                replyParameters: replyParameters,
-                replyMarkup: replyMarkup,
-                cancellationToken: cancellationToken);
+            return await TelegramRetryPolicy.ExecuteAsync(
+                token => botClient.SendMessage(
+                    chatId: chatId,
+                    text: formattedText.Text,
+                    replyParameters: replyParameters,
+                    replyMarkup: replyMarkup,
+                    cancellationToken: token),
+                cancellationToken);
         }
     }
 
@@ -769,24 +923,61 @@ public class TelegramBotHostedService(
 
         try
         {
-            await botClient.EditMessageText(
-                chatId: chatId,
-                messageId: messageId,
-                text: formattedText.Text,
-                entities: formattedText.Entities,
-                replyMarkup: replyMarkup,
-                cancellationToken: cancellationToken);
+            await TelegramRetryPolicy.ExecuteAsync(
+                token => botClient.EditMessageText(
+                    chatId: chatId,
+                    messageId: messageId,
+                    text: formattedText.Text,
+                    entities: formattedText.Entities,
+                    replyMarkup: replyMarkup,
+                    cancellationToken: token),
+                cancellationToken);
         }
         catch (ApiRequestException exception) when (IsFormattingParsingError(exception))
         {
             logger.LogWarning(exception, "Telegram rejected formatted edit. Falling back to plain text.");
 
-            await botClient.EditMessageText(
-                chatId: chatId,
-                messageId: messageId,
-                text: formattedText.Text,
-                replyMarkup: replyMarkup,
-                cancellationToken: cancellationToken);
+            await TelegramRetryPolicy.ExecuteAsync(
+                token => botClient.EditMessageText(
+                    chatId: chatId,
+                    messageId: messageId,
+                    text: formattedText.Text,
+                    replyMarkup: replyMarkup,
+                    cancellationToken: token),
+                cancellationToken);
+        }
+    }
+
+    private static Task DeleteMessageAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        int messageId,
+        CancellationToken cancellationToken)
+    {
+        return TelegramRetryPolicy.ExecuteAsync(
+            token => botClient.DeleteMessage(chatId, messageId, token),
+            cancellationToken);
+    }
+
+    private async Task TryEditStatusErrorAsync(
+        ITelegramBotClient botClient,
+        ChatId chatId,
+        int messageId,
+        Exception exception,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await EditTextMessageAsync(
+                botClient,
+                chatId,
+                messageId,
+                $"Ошибка обработки: {exception.Message}",
+                cancellationToken);
+        }
+        catch (Exception editException)
+        {
+            logger.LogWarning(editException, "Failed to update status message after audio processing error.");
         }
     }
 
@@ -794,6 +985,18 @@ public class TelegramBotHostedService(
     {
         return exception.Message.Contains("parse entities", StringComparison.OrdinalIgnoreCase)
                || exception.Message.Contains("can't parse entities", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsTransientTelegramException(ApiRequestException exception)
+    {
+        return exception.ErrorCode == 429 || exception.ErrorCode >= 500;
+    }
+
+    private static TimeSpan GetTelegramRetryDelay(int retryAttempt)
+    {
+        var delaySeconds = Math.Min(10, Math.Pow(2, retryAttempt - 1));
+        var jitterMilliseconds = Random.Shared.Next(100, 700);
+        return TimeSpan.FromSeconds(delaySeconds) + TimeSpan.FromMilliseconds(jitterMilliseconds);
     }
 }
 
