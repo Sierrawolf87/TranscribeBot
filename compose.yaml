@@ -7,11 +7,11 @@
     environment:
       - Telegram__Token=${TELEGRAM_TOKEN}
       - Telegram__AllowedUserIds=${TELEGRAM_ALLOWED_USER_IDS}
-      - OpenRouter__BaseUrl=${OPENROUTER_BASE_URL}
+      - OpenRouter__BaseUrl=${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
       - OpenRouter__ApiKey=${OPENROUTER_API_KEY}
-      - OpenRouter__ProcessingModel=${OPENROUTER_PROCESSING_MODEL}
-      - OpenRouter__CompressionModel=${OPENROUTER_COMPRESSION_MODEL}
-      - OpenRouter__ReasoningEffort=${OPENROUTER_REASONING_EFFORT}
+      - OpenRouter__ProcessingModel=${OPENROUTER_PROCESSING_MODEL:-google/gemini-3.1-flash-lite-preview}
+      - OpenRouter__CompressionModel=${OPENROUTER_COMPRESSION_MODEL:-google/gemini-3-flash-preview}
+      - OpenRouter__ReasoningEffort=${OPENROUTER_REASONING_EFFORT:-medium}
       - ConnectionStrings__DefaultConnection=${CONNECTION_STRING}
     depends_on:
       postgres:

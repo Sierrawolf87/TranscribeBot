@@ -21,45 +21,13 @@ public class AiService : IAiService
         .Or<TimeoutException>()
         .WaitAndRetryAsync(3, GetAiRetryDelay);
 
-    private const string AudioResponseSchema = """
-        {
-          "type": "object",
-          "properties": {
-            "transcription": { "type": ["string", "null"] },
-            "normalized": { "type": ["string", "null"] },
-            "summarized": { "type": ["string", "null"] }
-          },
-          "additionalProperties": false
-        }
-        """;
-
-    private const string CompressionResponseSchema = """
-        {
-          "type": "object",
-          "properties": {
-            "compressedText": { "type": ["string", "null"] }
-          },
-          "additionalProperties": false
-        }
-        """;
-
-    private const string ContextSummaryResponseSchema = """
-        {
-          "type": "object",
-          "properties": {
-            "summary": { "type": ["string", "null"] }
-          },
-          "additionalProperties": false
-        }
-        """;
-
     private readonly OpenAIClient _openAiClient;
     private readonly OpenRouterOptions _openRouterOptions;
     private readonly ILogger<AiService> _logger;
 
     public AiService(IOptions<OpenRouterOptions> openRouterOptions, ILogger<AiService> logger)
     {
-        _openRouterOptions = openRouterOptions.Value;
+        _openRouterOptions = NormalizeOptions(openRouterOptions.Value);
         _logger = logger;
 
         _openAiClient = new OpenAIClient(
@@ -68,6 +36,31 @@ public class AiService : IAiService
             {
                 Endpoint = new Uri(_openRouterOptions.BaseUrl)
             });
+    }
+
+    private static OpenRouterOptions NormalizeOptions(OpenRouterOptions options)
+    {
+        if (string.IsNullOrWhiteSpace(options.BaseUrl))
+        {
+            options.BaseUrl = OpenRouterOptions.DefaultBaseUrl;
+        }
+
+        if (string.IsNullOrWhiteSpace(options.ProcessingModel))
+        {
+            options.ProcessingModel = OpenRouterOptions.DefaultProcessingModel;
+        }
+
+        if (string.IsNullOrWhiteSpace(options.CompressionModel))
+        {
+            options.CompressionModel = OpenRouterOptions.DefaultCompressionModel;
+        }
+
+        if (string.IsNullOrWhiteSpace(options.ReasoningEffort))
+        {
+            options.ReasoningEffort = OpenRouterOptions.DefaultReasoningEffort;
+        }
+
+        return options;
     }
 
     public async Task<AudioProcessingResult> ProcessAudioAsync(
@@ -91,9 +84,11 @@ public class AiService : IAiService
         }
 
         var audioBytes = await BinaryData.FromStreamAsync(request.AudioStream, cancellationToken);
+        var responseFields = GetAudioResponseFields(request.ChatMode);
         var userInstructions = ChatMessageContentPart.CreateTextPart(
             $"Process the attached audio. Response language: {request.ResponseLanguage}. " +
-            $"Return only JSON that matches the schema. Active modes: {FormatModes(request.ChatMode)}.");
+            $"Return only a JSON object with these required fields: {FormatFieldList(responseFields)}. " +
+            $"Active modes: {FormatModes(request.ChatMode)}.");
 
         var audioPart = ChatMessageContentPart.CreateInputAudioPart(
             audioBytes,
@@ -103,17 +98,14 @@ public class AiService : IAiService
 
         var options = new ChatCompletionOptions
         {
-            ResponseFormat = ChatResponseFormat.CreateJsonSchemaFormat(
-                jsonSchemaFormatName: "transcribe_result",
-                jsonSchema: BinaryData.FromBytes(Encoding.UTF8.GetBytes(AudioResponseSchema)),
-                jsonSchemaIsStrict: true),
+            ResponseFormat = ChatResponseFormat.CreateJsonObjectFormat(),
             ReasoningEffortLevel = ResolveReasoningEffortLevel(_openRouterOptions.ReasoningEffort)
         };
 
         var completionResult = await AiRetryPolicy.ExecuteAsync(
             token => chatClient.CompleteChatAsync(messages, options, token),
             cancellationToken);
-        return ParseAudioCompletion(completionResult.Value);
+        return ParseAudioCompletion(completionResult.Value, responseFields);
     }
 
     public async Task<ContextCompressionAiResult> CompressContextAsync(
@@ -131,10 +123,7 @@ public class AiService : IAiService
 
         var options = new ChatCompletionOptions
         {
-            ResponseFormat = ChatResponseFormat.CreateJsonSchemaFormat(
-                jsonSchemaFormatName: "compressed_context",
-                jsonSchema: BinaryData.FromBytes(Encoding.UTF8.GetBytes(CompressionResponseSchema)),
-                jsonSchemaIsStrict: true),
+            ResponseFormat = ChatResponseFormat.CreateJsonObjectFormat(),
             MaxOutputTokenCount = 4096,
             ReasoningEffortLevel = ResolveReasoningEffortLevel(_openRouterOptions.ReasoningEffort)
         };
@@ -160,10 +149,7 @@ public class AiService : IAiService
 
         var options = new ChatCompletionOptions
         {
-            ResponseFormat = ChatResponseFormat.CreateJsonSchemaFormat(
-                jsonSchemaFormatName: "context_summary",
-                jsonSchema: BinaryData.FromBytes(Encoding.UTF8.GetBytes(ContextSummaryResponseSchema)),
-                jsonSchemaIsStrict: true),
+            ResponseFormat = ChatResponseFormat.CreateJsonObjectFormat(),
             ReasoningEffortLevel = ResolveReasoningEffortLevel(_openRouterOptions.ReasoningEffort)
         };
 
@@ -173,15 +159,25 @@ public class AiService : IAiService
         return ParseContextSummaryCompletion(completionResult.Value);
     }
 
-    private AudioProcessingResult ParseAudioCompletion(ChatCompletion completion)
+    private AudioProcessingResult ParseAudioCompletion(
+        ChatCompletion completion,
+        IReadOnlyCollection<string> requiredFields)
     {
         var root = ParseResponseRoot(completion);
         var usage = completion.Usage;
+        var requiredFieldSet = requiredFields.ToHashSet(StringComparer.Ordinal);
+
         var result = new AudioProcessingResult
         {
-            Transcription = TryGetOptionalString(root, "transcription"),
-            Normalized = TryGetOptionalString(root, "normalized"),
-            Summarized = TryGetOptionalString(root, "summarized"),
+            Transcription = requiredFieldSet.Contains("transcription")
+                ? GetRequiredString(root, "transcription")
+                : null,
+            Normalized = requiredFieldSet.Contains("normalized")
+                ? GetRequiredString(root, "normalized")
+                : null,
+            Summarized = requiredFieldSet.Contains("summarized")
+                ? GetRequiredString(root, "summarized")
+                : null,
             InputTokens = usage?.InputTokenCount ?? 0,
             OutputTokens = usage?.OutputTokenCount ?? 0
         };
@@ -200,7 +196,7 @@ public class AiService : IAiService
         var usage = completion.Usage;
         var result = new ContextCompressionAiResult
         {
-            CompressedText = TryGetOptionalString(root, "compressedText"),
+            CompressedText = GetRequiredString(root, "compressedText"),
             InputTokens = usage?.InputTokenCount ?? 0,
             OutputTokens = usage?.OutputTokenCount ?? 0
         };
@@ -219,7 +215,7 @@ public class AiService : IAiService
         var usage = completion.Usage;
         var result = new ContextSummaryAiResult
         {
-            Summary = TryGetOptionalString(root, "summary"),
+            Summary = GetRequiredString(root, "summary"),
             InputTokens = usage?.InputTokenCount ?? 0,
             OutputTokens = usage?.OutputTokenCount ?? 0
         };
@@ -244,23 +240,133 @@ public class AiService : IAiService
             throw new InvalidOperationException("AI service returned an empty response.");
         }
 
+        responseText = NormalizeJsonObjectResponse(responseText);
+
         using var document = JsonDocument.Parse(responseText);
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("AI service returned JSON, but the root value is not an object.");
+        }
+
         return document.RootElement.Clone();
     }
 
-    private static string? TryGetOptionalString(JsonElement root, string propertyName)
+    private static string NormalizeJsonObjectResponse(string responseText)
     {
-        if (!root.TryGetProperty(propertyName, out var property))
+        var trimmed = responseText.Trim().TrimStart('\uFEFF');
+        if (trimmed.StartsWith("```", StringComparison.Ordinal))
+        {
+            trimmed = StripMarkdownFence(trimmed);
+        }
+
+        if (trimmed.StartsWith('{'))
+        {
+            return ExtractFirstJsonObject(trimmed) ?? trimmed;
+        }
+
+        var jsonObject = ExtractFirstJsonObject(trimmed);
+        if (jsonObject is not null)
+        {
+            return jsonObject;
+        }
+
+        throw new InvalidOperationException("AI service returned a response that does not contain a JSON object.");
+    }
+
+    private static string StripMarkdownFence(string responseText)
+    {
+        var firstLineEnd = responseText.IndexOf('\n');
+        if (firstLineEnd < 0)
+        {
+            return responseText;
+        }
+
+        var contentStart = firstLineEnd + 1;
+        var closingFenceStart = responseText.LastIndexOf("```", StringComparison.Ordinal);
+        if (closingFenceStart <= contentStart)
+        {
+            return responseText[contentStart..].Trim();
+        }
+
+        return responseText[contentStart..closingFenceStart].Trim();
+    }
+
+    private static string? ExtractFirstJsonObject(string responseText)
+    {
+        var start = responseText.IndexOf('{');
+        if (start < 0)
         {
             return null;
         }
 
-        return property.ValueKind switch
+        var depth = 0;
+        var inString = false;
+        var isEscaped = false;
+
+        for (var index = start; index < responseText.Length; index++)
         {
-            JsonValueKind.String => property.GetString(),
-            JsonValueKind.Null => null,
-            _ => property.ToString()
-        };
+            var character = responseText[index];
+
+            if (inString)
+            {
+                if (isEscaped)
+                {
+                    isEscaped = false;
+                }
+                else if (character == '\\')
+                {
+                    isEscaped = true;
+                }
+                else if (character == '"')
+                {
+                    inString = false;
+                }
+
+                continue;
+            }
+
+            if (character == '"')
+            {
+                inString = true;
+                continue;
+            }
+
+            if (character == '{')
+            {
+                depth++;
+            }
+            else if (character == '}')
+            {
+                depth--;
+                if (depth == 0)
+                {
+                    return responseText[start..(index + 1)];
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static string GetRequiredString(JsonElement root, string propertyName)
+    {
+        if (!root.TryGetProperty(propertyName, out var property))
+        {
+            throw new InvalidOperationException($"AI service response does not contain required field '{propertyName}'.");
+        }
+
+        if (property.ValueKind != JsonValueKind.String)
+        {
+            throw new InvalidOperationException($"AI service response field '{propertyName}' must be a string.");
+        }
+
+        var value = property.GetString();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            throw new InvalidOperationException($"AI service response field '{propertyName}' is empty.");
+        }
+
+        return value;
     }
 
     private static ChatReasoningEffortLevel ResolveReasoningEffortLevel(string? reasoningEffort)
@@ -320,12 +426,14 @@ public class AiService : IAiService
             "You process user voice messages. " +
             $"Your task is to {string.Join("; ", actions)}. " +
             $"Write the content of returned fields in '{responseLanguage}'. " +
+            $"Return only a JSON object with exactly these required fields: {FormatFieldList(GetAudioResponseFields(chatMode))}. " +
+            "Do not wrap the JSON object in Markdown fences or any other text. " +
+            "Every required field must be a non-empty string. Do not return null, empty strings, or omit required fields. " +
+            "Do not include fields that are not listed as required. " +
+            $"If the audio contains no speech or speech cannot be transcribed, fill every required field with a sentence in '{responseLanguage}' meaning: 'There is no speech in this audio, so transcription is impossible'. " +
             "Markdown formatting is allowed in returned text. Use standard Markdown for simple formatting. " +
             "Use '**bold**', '*italic*', '`code`', fenced code blocks, '[text](url)', '# headings', and flat lists with '-' or '1.'. " +
             "Do not use tables or nested lists. " +
-            "Fill only the fields that correspond to the selected modes. " +
-            "Fill normalized and summarized only when their corresponding modes are selected. " +
-            "Return null for optional fields that were not requested. " +
             "For transcription, if the audio clearly contains multiple different speakers, separate their utterances with labels such as 'Speaker 1', 'Speaker 2', and so on. " +
             "Use a real person's name only if the speaker identity is explicitly clear from the audio or context. " +
             "Do not guess or assign names just because a name was mentioned in the conversation. " +
@@ -349,7 +457,9 @@ public class AiService : IAiService
             "Do not use tables or nested lists. " +
             "Preserve facts, agreements, entities, names, numbers, deadlines, and important context. " +
             "Remove repetition and secondary details. " +
-            "Return only JSON with the compressedText field.";
+            "Return only a JSON object with exactly one required field: \"compressedText\". " +
+            "Do not wrap the JSON object in Markdown fences or any other text. " +
+            "The compressedText field must be a non-empty string.";
     }
 
     private static string BuildContextSummarySystemPrompt(string responseLanguage)
@@ -367,7 +477,41 @@ public class AiService : IAiService
             "If the messages contain unrelated discussions, separate them into distinct topics. " +
             "For each topic, preserve participants, decisions, facts, dates, numbers, reasons, dependencies, open questions, and action items when present. " +
             "Do not invent information and do not merge unrelated topics. " +
-            "Return only JSON with the summary field.";
+            "Return only a JSON object with exactly one required field: \"summary\". " +
+            "Do not wrap the JSON object in Markdown fences or any other text. " +
+            "The summary field must be a non-empty string.";
+    }
+
+    private static IReadOnlyList<string> GetAudioResponseFields(ChatMode chatMode)
+    {
+        var fields = new List<string>();
+
+        if (chatMode.HasFlag(ChatMode.Transcribe))
+        {
+            fields.Add("transcription");
+        }
+
+        if (chatMode.HasFlag(ChatMode.Normalize))
+        {
+            fields.Add("normalized");
+        }
+
+        if (chatMode.HasFlag(ChatMode.Summarize))
+        {
+            fields.Add("summarized");
+        }
+
+        if (fields.Count == 0)
+        {
+            fields.Add("transcription");
+        }
+
+        return fields;
+    }
+
+    private static string FormatFieldList(IReadOnlyCollection<string> fields)
+    {
+        return string.Join(", ", fields.Select(field => $"\"{field}\""));
     }
 
     private static string BuildContextBlock(IReadOnlyCollection<AiRequestContextMessage> contextMessages)
