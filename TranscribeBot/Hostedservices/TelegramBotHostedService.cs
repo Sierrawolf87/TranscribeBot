@@ -39,6 +39,7 @@ public class TelegramBotHostedService(
 
     private readonly TelegramOptions _telegramOptions = telegramOptions.Value;
     private TelegramBotClient? _botClient;
+    private string? _botUsername;
     private CancellationTokenSource? _stoppingCts;
     private Task? _receivingTask;
 
@@ -51,6 +52,9 @@ public class TelegramBotHostedService(
 
         _botClient = new TelegramBotClient(_telegramOptions.Token);
         _stoppingCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+        var botMe = await _botClient.GetMe(cancellationToken);
+        _botUsername = botMe.Username;
 
         await SeedAllowedUsersAsync(cancellationToken);
         await RegisterBotCommandsAsync(_botClient, cancellationToken);
@@ -142,6 +146,12 @@ public class TelegramBotHostedService(
             return;
         }
 
+        if (TryGetGuestModeMediaMessage(message, _botUsername, out var guestModeMediaMessage))
+        {
+            await HandleGuestModeMessageAsync(botClient, message, guestModeMediaMessage, transcribeService, cancellationToken);
+            return;
+        }
+
         if (!string.IsNullOrWhiteSpace(message.Text) && message.Text.StartsWith('/'))
         {
             await HandleCommandAsync(botClient, message, transcribeService, cancellationToken);
@@ -154,11 +164,11 @@ public class TelegramBotHostedService(
             return;
         }
 
-        if (message.Voice is null && message.VideoNote is null && message.Video is null)
+        if (!HasSupportedMedia(message))
         {
             await botClient.SendMessage(
                 chatId: message.Chat.Id,
-                text: "Поддерживаются голосовые сообщения, кружки и видео до 20 минут. Настройки доступны в /settings.",
+                text: "Поддерживаются голосовые сообщения, кружки, видео и аудио до 20 минут. Настройки доступны в /settings.",
                 cancellationToken: cancellationToken);
             return;
         }
@@ -189,7 +199,8 @@ public class TelegramBotHostedService(
         Message message,
         AudioProcessingSettingsSnapshot settingsSnapshot,
         int statusMessageId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        int? replyToMessageId = null)
     {
         var telegramUserId = GetTelegramUserId(message);
 
@@ -232,7 +243,7 @@ public class TelegramBotHostedService(
                     text: responseMessage,
                     replyParameters: new ReplyParameters
                     {
-                        MessageId = message.Id,
+                        MessageId = replyToMessageId ?? message.Id,
                         AllowSendingWithoutReply = true
                     },
                     cancellationToken: cancellationToken);
@@ -651,6 +662,14 @@ public class TelegramBotHostedService(
                 : message.Video.FileName;
             durationSeconds = message.Video.Duration;
         }
+        else if (message.Audio is not null)
+        {
+            fileId = message.Audio.FileId;
+            fileName = string.IsNullOrWhiteSpace(message.Audio.FileName)
+                ? $"{message.Audio.FileUniqueId}.mp3"
+                : message.Audio.FileName;
+            durationSeconds = message.Audio.Duration;
+        }
         else
         {
             throw new InvalidOperationException("Message does not contain supported media.");
@@ -676,7 +695,7 @@ public class TelegramBotHostedService(
     private static string BuildStartMessage()
     {
         return
-            "Бот принимает голосовые сообщения, кружки и видео до 20 минут.\n" +
+            "Бот принимает голосовые сообщения, кружки, видео и аудио до 20 минут.\n" +
             "Команды:\n" +
             "/settings - настройки режимов, контекста и языка\n" +
             "/reset_context - очистить историю\n" +
@@ -847,6 +866,83 @@ public class TelegramBotHostedService(
         }
     }
 
+    private async Task HandleGuestModeMessageAsync(
+        ITelegramBotClient botClient,
+        Message mentionMessage,
+        Message mediaMessage,
+        ITranscribeService transcribeService,
+        CancellationToken cancellationToken)
+    {
+        var telegramUserId = GetTelegramUserId(mentionMessage);
+        var user = await transcribeService.GetOrCreateUserAsync(
+            telegramUserId,
+            mentionMessage.From?.Username,
+            cancellationToken);
+        var settingsSnapshot = new AudioProcessingSettingsSnapshot(
+            string.IsNullOrWhiteSpace(user.Settings.Language) ? "ru" : user.Settings.Language,
+            ChatMode.Normalize,
+            false);
+
+        var statusMessage = await SendTextMessageAsync(
+            botClient,
+            chatId: mentionMessage.Chat.Id,
+            text: "⏳ Нормализация аудио в guest mode",
+            replyParameters: new ReplyParameters
+            {
+                MessageId = mentionMessage.Id,
+                AllowSendingWithoutReply = true
+            },
+            cancellationToken: cancellationToken);
+
+        await userProcessingQueue.EnqueueAsync(
+            telegramUserId,
+            token => ProcessAudioMessageAsync(botClient, mediaMessage, settingsSnapshot, statusMessage.Id, token, mentionMessage.Id),
+            requiresGlobalSlot: true,
+            preserveUserOrder: false,
+            cancellationToken);
+    }
+
+    private static bool TryGetGuestModeMediaMessage(
+        Message message,
+        string? botUsername,
+        out Message mediaMessage)
+    {
+        mediaMessage = null!;
+
+        if (message.ReplyToMessage is null || !HasSupportedMedia(message.ReplyToMessage))
+        {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(botUsername))
+        {
+            return false;
+        }
+
+        var mention = $"@{botUsername}";
+        if (!ContainsBotMention(message.Text, mention) && !ContainsBotMention(message.Caption, mention))
+        {
+            return false;
+        }
+
+        mediaMessage = message.ReplyToMessage;
+        return true;
+    }
+
+    private static bool ContainsBotMention(string? text, string mention)
+    {
+        return !string.IsNullOrWhiteSpace(text)
+               && text.Contains(mention, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool HasSupportedMedia(Message message)
+    {
+        return message.Voice is not null
+               || message.VideoNote is not null
+               || message.Video is not null
+               || message.Audio is not null;
+    }
+
     private static long GetTelegramUserId(Message message)
     {
         return message.From?.Id ?? message.Chat.Id;
@@ -999,5 +1095,4 @@ public class TelegramBotHostedService(
         return TimeSpan.FromSeconds(delaySeconds) + TimeSpan.FromMilliseconds(jitterMilliseconds);
     }
 }
-
 
