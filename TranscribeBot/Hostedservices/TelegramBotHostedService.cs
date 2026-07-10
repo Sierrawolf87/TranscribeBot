@@ -154,11 +154,11 @@ public class TelegramBotHostedService(
             return;
         }
 
-        if (message.Voice is null && message.VideoNote is null && message.Video is null)
+        if (message.Voice is null && message.VideoNote is null && message.Video is null && message.Audio is null)
         {
             await botClient.SendMessage(
                 chatId: message.Chat.Id,
-                text: "Поддерживаются голосовые сообщения, кружки и видео до 20 минут. Настройки доступны в /settings.",
+                text: "Поддерживаются голосовые сообщения, аудио, кружки и видео до 20 минут. Настройки доступны в /settings.",
                 cancellationToken: cancellationToken);
             return;
         }
@@ -651,6 +651,14 @@ public class TelegramBotHostedService(
                 : message.Video.FileName;
             durationSeconds = message.Video.Duration;
         }
+        else if (message.Audio is not null)
+        {
+            fileId = message.Audio.FileId;
+            fileName = string.IsNullOrWhiteSpace(message.Audio.FileName)
+                ? $"{message.Audio.FileUniqueId}.mp3"
+                : message.Audio.FileName;
+            durationSeconds = message.Audio.Duration;
+        }
         else
         {
             throw new InvalidOperationException("Message does not contain supported media.");
@@ -676,7 +684,7 @@ public class TelegramBotHostedService(
     private static string BuildStartMessage()
     {
         return
-            "Бот принимает голосовые сообщения, кружки и видео до 20 минут.\n" +
+            "Бот принимает голосовые сообщения, аудио, кружки и видео до 20 минут.\n" +
             "Команды:\n" +
             "/settings - настройки режимов, контекста и языка\n" +
             "/reset_context - очистить историю\n" +
