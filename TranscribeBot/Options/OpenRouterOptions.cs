@@ -4,7 +4,7 @@ public sealed class OpenRouterOptions
 {
     public const string SectionName = "OpenRouter";
     public const string DefaultBaseUrl = "https://openrouter.ai/api/v1";
-    public const string DefaultProcessingModel = "google/gemini-3.1-flash-lite-preview";
+    public const string DefaultProcessingModel = "google/gemini-3-flash-preview";
     public const string DefaultCompressionModel = "google/gemini-3-flash-preview";
     public const string DefaultReasoningEffort = "medium";
 

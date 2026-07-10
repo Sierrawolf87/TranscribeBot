@@ -6,6 +6,7 @@ using Telegram.Bot.Exceptions;
 using Telegram.Bot.Polling;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
+using Telegram.Bot.Types.InlineQueryResults;
 using Telegram.Bot.Types.ReplyMarkups;
 using TranscribeBot.Interfaces;
 using TranscribeBot.Models;
@@ -102,6 +103,9 @@ public class TelegramBotHostedService(
                 case UpdateType.CallbackQuery when update.CallbackQuery is not null:
                     await HandleCallbackQueryAsync(botClient, update.CallbackQuery, cancellationToken);
                     break;
+                case UpdateType.GuestMessage when update.GuestMessage is not null:
+                    await HandleGuestMessageAsync(botClient, update.GuestMessage, cancellationToken);
+                    break;
                 default:
                     logger.LogDebug("Ignored update type {UpdateType}.", update.Type);
                     break;
@@ -118,6 +122,124 @@ public class TelegramBotHostedService(
                     chatId: chatId.Value,
                     text: $"Ошибка обработки: {exception.Message}",
                     cancellationToken: cancellationToken);
+            }
+        }
+    }
+
+    private async Task HandleGuestMessageAsync(
+        ITelegramBotClient botClient,
+        Message guestMessage,
+        CancellationToken cancellationToken)
+    {
+        var guestQueryId = guestMessage.GuestQueryId;
+        if (string.IsNullOrWhiteSpace(guestQueryId))
+        {
+            logger.LogWarning("Guest message {MessageId} does not contain a guest query id.", guestMessage.Id);
+            return;
+        }
+
+        var telegramUserId = GetTelegramUserId(guestMessage);
+        var sourceMessage = guestMessage.ReplyToMessage;
+
+        await using var scope = serviceScopeFactory.CreateAsyncScope();
+        var transcribeService = scope.ServiceProvider.GetRequiredService<ITranscribeService>();
+
+        if (!await transcribeService.IsUserAllowedAsync(telegramUserId, cancellationToken))
+        {
+            await AnswerGuestQueryAsync(botClient, guestQueryId, "У тебя нет доступа к этому боту.", cancellationToken);
+            return;
+        }
+
+        if (sourceMessage is null || !ContainsSupportedMedia(sourceMessage))
+        {
+            await AnswerGuestQueryAsync(
+                botClient,
+                guestQueryId,
+                "Вызови бота ответом на голосовое сообщение, аудио, кружок или видео.",
+                cancellationToken);
+            return;
+        }
+
+        var user = await transcribeService.GetOrCreateUserAsync(
+            telegramUserId,
+            guestMessage.From?.Username,
+            cancellationToken);
+        var settingsSnapshot = new AudioProcessingSettingsSnapshot(
+            string.IsNullOrWhiteSpace(user.Settings.Language) ? "ru" : user.Settings.Language,
+            ChatMode.Normalize,
+            UseContext: false);
+
+        await userProcessingQueue.EnqueueAsync(
+            telegramUserId,
+            token => ProcessGuestAudioMessageAsync(
+                botClient,
+                guestMessage,
+                sourceMessage,
+                guestQueryId,
+                settingsSnapshot,
+                token),
+            requiresGlobalSlot: true,
+            preserveUserOrder: false,
+            cancellationToken);
+    }
+
+    private async Task ProcessGuestAudioMessageAsync(
+        ITelegramBotClient botClient,
+        Message guestMessage,
+        Message sourceMessage,
+        string guestQueryId,
+        AudioProcessingSettingsSnapshot settingsSnapshot,
+        CancellationToken cancellationToken)
+    {
+        var telegramUserId = GetTelegramUserId(guestMessage);
+
+        try
+        {
+            await using var scope = serviceScopeFactory.CreateAsyncScope();
+            var transcribeService = scope.ServiceProvider.GetRequiredService<ITranscribeService>();
+            using var audioFile = await DownloadTelegramAudioAsync(botClient, sourceMessage, cancellationToken);
+
+            var responseMessages = await transcribeService.ProcessAudioAsync(
+                new AudioTranscriptionRequest
+                {
+                    TelegramUserId = telegramUserId,
+                    Username = guestMessage.From?.Username,
+                    AudioStream = audioFile.Content,
+                    FileName = audioFile.FileName,
+                    DurationSeconds = audioFile.DurationSeconds,
+                    Settings = settingsSnapshot
+                },
+                cancellationToken);
+
+            var responseText = string.Join("\n\n", responseMessages);
+            await AnswerGuestQueryAsync(botClient, guestQueryId, responseText, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            logger.LogInformation(
+                "Guest audio processing cancelled for TelegramUserId={TelegramUserId}, MessageId={MessageId}.",
+                telegramUserId,
+                guestMessage.Id);
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(
+                exception,
+                "Guest audio processing failed for TelegramUserId={TelegramUserId}, MessageId={MessageId}.",
+                telegramUserId,
+                guestMessage.Id);
+
+            try
+            {
+                await AnswerGuestQueryAsync(
+                    botClient,
+                    guestQueryId,
+                    $"Ошибка обработки: {exception.Message}",
+                    CancellationToken.None);
+            }
+            catch (Exception answerException)
+            {
+                logger.LogWarning(answerException, "Failed to answer guest query after audio processing error.");
             }
         }
     }
@@ -679,6 +801,42 @@ public class TelegramBotHostedService(
             FileName = fileName,
             DurationSeconds = durationSeconds
         };
+    }
+
+    private static bool ContainsSupportedMedia(Message message)
+    {
+        return message.Voice is not null
+               || message.VideoNote is not null
+               || message.Video is not null
+               || message.Audio is not null;
+    }
+
+    private static Task<SentGuestMessage> AnswerGuestQueryAsync(
+        ITelegramBotClient botClient,
+        string guestQueryId,
+        string text,
+        CancellationToken cancellationToken)
+    {
+        const int maxMessageLength = 4096;
+        var answer = string.IsNullOrWhiteSpace(text) ? "Не удалось получить нормализацию." : text.Trim();
+        if (answer.Length > maxMessageLength)
+        {
+            answer = answer[..(maxMessageLength - 1)] + "…";
+        }
+
+        var formattedText = TelegramMarkdownFormatter.Render(answer);
+
+        var result = new InlineQueryResultArticle(
+            id: "guest-normalization",
+            title: "Нормализация",
+            inputMessageContent: new InputTextMessageContent(formattedText.Text)
+            {
+                Entities = formattedText.Entities.ToArray()
+            });
+
+        return TelegramRetryPolicy.ExecuteAsync(
+            token => botClient.AnswerGuestQuery(guestQueryId, result, token),
+            cancellationToken);
     }
 
     private static string BuildStartMessage()
