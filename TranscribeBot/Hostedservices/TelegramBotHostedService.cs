@@ -39,6 +39,8 @@ public class TelegramBotHostedService(
         .WaitAndRetryAsync(3, GetTelegramRetryDelay);
 
     private readonly TelegramOptions _telegramOptions = telegramOptions.Value;
+    private readonly IReadOnlySet<long> _configuredAdminUserIds = ParseAllowedUserIds(telegramOptions.Value.AllowedUserIds)
+        .ToHashSet();
     private TelegramBotClient? _botClient;
     private CancellationTokenSource? _stoppingCts;
     private Task? _receivingTask;
@@ -455,6 +457,15 @@ public class TelegramBotHostedService(
 
             case AllowUserCommand:
             {
+                if (!_configuredAdminUserIds.Contains(telegramUserId))
+                {
+                    await botClient.SendMessage(
+                        chatId: message.Chat.Id,
+                        text: "Только администраторы могут выдавать доступ к боту.",
+                        cancellationToken: cancellationToken);
+                    break;
+                }
+
                 if (!TryParseTelegramUserIdArgument(message.Text, out var allowedTelegramUserId))
                 {
                     await botClient.SendMessage(
@@ -480,6 +491,15 @@ public class TelegramBotHostedService(
 
             case DenyUserCommand:
             {
+                if (!_configuredAdminUserIds.Contains(telegramUserId))
+                {
+                    await botClient.SendMessage(
+                        chatId: message.Chat.Id,
+                        text: "Только администраторы могут отзывать доступ к боту.",
+                        cancellationToken: cancellationToken);
+                    break;
+                }
+
                 if (!TryParseTelegramUserIdArgument(message.Text, out var deniedTelegramUserId))
                 {
                     await botClient.SendMessage(
@@ -494,6 +514,15 @@ public class TelegramBotHostedService(
                     await botClient.SendMessage(
                         chatId: message.Chat.Id,
                         text: "Нельзя удалить доступ у самого себя.",
+                        cancellationToken: cancellationToken);
+                    break;
+                }
+
+                if (_configuredAdminUserIds.Contains(deniedTelegramUserId))
+                {
+                    await botClient.SendMessage(
+                        chatId: message.Chat.Id,
+                        text: "Нельзя удалить доступ у администратора, указанного в конфигурации.",
                         cancellationToken: cancellationToken);
                     break;
                 }
@@ -997,7 +1026,7 @@ public class TelegramBotHostedService(
 
     private async Task SeedAllowedUsersAsync(CancellationToken cancellationToken)
     {
-        var allowedUserIds = ParseAllowedUserIds(_telegramOptions.AllowedUserIds);
+        var allowedUserIds = _configuredAdminUserIds;
         if (allowedUserIds.Count == 0)
         {
             logger.LogWarning("Telegram allowlist is empty. Configure Telegram:AllowedUserIds before starting the bot.");
@@ -1165,5 +1194,4 @@ public class TelegramBotHostedService(
         return TimeSpan.FromSeconds(delaySeconds) + TimeSpan.FromMilliseconds(jitterMilliseconds);
     }
 }
-
 
